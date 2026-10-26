@@ -1,0 +1,131 @@
+name: PeerTool Android Build
+
+on:
+  push:
+    paths:
+      - "PeerTool-Android.zip"
+      - ".github/workflows/peer-tool-android.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify ZIP exists
+        run: |
+          if [ ! -f PeerTool-Android.zip ]; then
+            echo "ERROR: PeerTool-Android.zip not found at repository root."
+            ls -la
+            exit 1
+          fi
+          echo "Found PeerTool-Android.zip ($(du -h PeerTool-Android.zip | cut -f1))"
+
+      - name: Extract project
+        run: |
+          mkdir -p extracted
+          unzip -q PeerTool-Android.zip -d extracted
+          # Flatten if the ZIP contains a single top-level folder
+          if [ $(ls extracted | wc -l) -eq 1 ] && [ -d extracted/$(ls extracted) ]; then
+            TOP=$(ls extracted)
+            mv extracted/$TOP/* extracted/ 2>/dev/null || true
+            mv extracted/$TOP/.[!.]* extracted/ 2>/dev/null || true
+            rmdir extracted/$TOP 2>/dev/null || true
+          fi
+          echo "Project root contents:"
+          ls -la extracted/
+          if [ ! -f extracted/settings.gradle.kts ] && [ ! -f extracted/settings.gradle ]; then
+            echo "ERROR: No settings.gradle(.kts) found after extraction."
+            find extracted -name "settings.gradle*" -o -name "build.gradle*" | head -20
+            exit 1
+          fi
+          if [ ! -f extracted/gradlew ]; then
+            echo "WARNING: gradlew missing – will bootstrap later if needed."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+
+      - name: Make gradlew executable
+        working-directory: extracted
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+          else
+            echo "Bootstrapping Gradle wrapper..."
+            gradle wrapper --gradle-version 8.9
+            chmod +x gradlew
+          fi
+
+      - name: Grant execute and show environment
+        working-directory: extracted
+        run: |
+          chmod +x gradlew || true
+          ./gradlew --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+      - name: Resolve dependencies & assemble debug APK
+        working-directory: extracted
+        run: |
+          ./gradlew assembleDebug --stacktrace --no-daemon
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+
+      - name: Run unit tests
+        working-directory: extracted
+        continue-on-error: true
+        run: ./gradlew testDebugUnitTest --stacktrace --no-daemon || true
+
+      - name: Run lint
+        working-directory: extracted
+        continue-on-error: true
+        run: ./gradlew lintDebug --stacktrace --no-daemon || true
+
+      - name: Locate APK
+        id: find_apk
+        working-directory: extracted
+        run: |
+          APK=$(find . -path "*/build/outputs/apk/debug/*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: No debug APK found."
+            find . -name "*.apk" || true
+            exit 1
+          fi
+          echo "Found APK: $APK"
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          cp "$APK" PeerTool-debug.apk
+          ls -la PeerTool-debug.apk
+
+      - name: Upload PeerTool debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PeerTool-debug-APK
+          path: extracted/PeerTool-debug.apk
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload test & lint reports (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PeerTool-reports
+          path: |
+            extracted/app/build/reports/
+            extracted/app/build/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
